@@ -1,15 +1,24 @@
 # adg-vpn
 广告和代理共存模块
 
-## 当前版本 (20261004)
+## 当前版本 (20261005)
 
 | 文件 | 说明 |
 |------|------|
-| `AdGuard.Home.For.Android.20261004.zip` | AdGuard Home 模块，内置 Google 放行规则与手动重启脚本 |
-| `box_1.2.10.20261004.zip` | Box 代理模块，mihomo 配置新增 Google 分流组 |
-| `纠正ad配置.sh` | AGH user_rules 修复/注入脚本（冲突去重、语法修复、Google 域名放行） |
+| `AdGuard.Home.For.Android.20261005.zip` | AGH 模块：Google 放行规则 + Google 域名族走 8.8.8.8 DoH + restart.sh |
+| `box_1.2.11.20261005.zip` | Box 模块：Google 分流组 + tun 栈 system（高速） |
+| `纠正ad配置.sh` | AGH user_rules 修复/注入脚本 |
+| `restart.sh`(模块内) | 修改 yaml 后手动重启生效 |
+| `诊断*.sh` | 链路分层诊断脚本 |
+| `优化网速*.sh` | 一键提速(gvisor→system)与多目标测速 |
 
-### 本次更新
+### 20261005 更新（实测有效）
+
+1. **AGH**：upstream_dns 顶部新增 per-domain 上游，`googleapis.com/gvt1.com/google.com/gstatic.com/googleusercontent.com/ggpht.com/googlevideo.com` 全部改走 `https://8.8.8.8/dns-query`——绕开国内 DoH 被 GFW 污染的缓存（`update.googleapis.com` 被污染成联通 IP 是 Play 下载失败的根因）
+2. **box**：tun 栈 `gvisor → system`——gvisor 用户态协议栈是手机端吞吐瓶颈，实测换 system 后下载速度恢复正常
+3. 注意：system 栈不兼容的设备可改回 `stack: gvisor`；机场普遍封锁 speed.cloudflare.com 测速端点，测速请用 fast.com
+
+### 20261004 更新
 
 1. **AGH 内置 Google 放行规则**：AdGuardHome.yaml 的 user_rules 顶部注入 8 条
    `$important` 白名单（`googleapis.com`、`android.clients.google.com`、
