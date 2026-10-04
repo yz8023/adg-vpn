@@ -13,6 +13,18 @@ This file records user instructions, preferences, and teachings for reference in
 
 ## Entries
 
+[链路排障经验 - AGH+box 共存架构]
+- Date: 2026-10-05
+- Context: Agent 排查"Play 下载失败/Google 登录弹窗不出现/网速跑不满"三天会话后确认
+- Category: Troubleshooting & Debugging
+- Instructions:
+  - 排障工具链在仓库根目录：诊断.sh(分层) -> 诊断2.sh -> 诊断3.sh -> 优化网速*.sh，让用户在手机上 su -c "sh 脚本" 后贴回输出
+  - MonkeyCode 手机 shell 没有 nslookup 命令，测 DNS 必须用 busybox nslookup(/data/adb/ksu/bin/busybox)，否则误判"解析失败"
+  - 国内 DoH 上游(1.12.12.12/120.53.53.53)会被 GFW 污染 Google 域名缓存(update.googleapis.com 曾解析成联通 IP)，修复方法=AGH upstream_dns 加 per-domain 规则走 https://8.8.8.8/dns-query(经代理出站)；直连 53/853 在此架构中被 iptables 封锁，上游只能用 DoH
+  - 手机端吞吐瓶颈常是 mihomo tun 的 gvisor 用户态栈，换 stack: system 实测恢复；机场普遍封锁 speed.cloudflare.com 测速端点(TLS 握手被断)，测速用 fast.com/cachefly/tele2
+  - AGH 白名单 @@||域名^$important 可压过任何过滤列表拦截；用户可能直接在 Web UI 加规则，脚本检查 yaml 注释标记会误报"旧配置"，以 querylog 的 Rules.Text 为准
+  - AGH 端口随机化在 service.sh 开机时执行，改 yaml 后手动重启进程不变端口；三方一致性检查点：yaml dns.port = config.prop redir_port = mihomo nameserver 端口
+
 [模块打包发版流程]
 - Date: 2026-10-04
 - Context: Agent 执行模块重新打包发布任务时确认
