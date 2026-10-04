@@ -43,6 +43,23 @@ BEGIN {
     while ((getline line < cf) > 0) conflict[line] = 1
     close(cf)
     in_rules = 0
+    # Google 下载/登录依赖域名，强制放行（$important 白名单可压过任何 $important 拦截）
+    GOOGLE_ALLOW = "googleapis.com android.clients.google.com accounts.google.com accounts.gstatic.com ssl.gstatic.com www.gstatic.com connectivitycheck.gstatic.com gvt1.com"
+}
+
+/^user_rules:[[:space:]]*$/ {
+    in_rules = 1
+    print
+    n = split(GOOGLE_ALLOW, ga, " ")
+    for (gi = 1; gi <= n; gi++) {
+        r = "@@||" ga[gi] "^$important"
+        if (!(r in seen)) {
+            seen[r] = 1
+            print "  # [Google-放行] Play下载/账号登录依赖域名"
+            print "  - " Q r Q
+        }
+    }
+    next
 }
 
 /^user_rules:[[:space:]]*$/ { in_rules = 1; print; next }
@@ -115,6 +132,7 @@ echo " 冲突域名总数:  $(wc -l < "$TMP/conflict_d" | tr -d ' ')"
 echo " 语法修复条数:  $(grep -c '\[语法已修复\]' "$DST" 2>/dev/null || echo 0)"
 echo " 冲突注释条数:  $(grep -c '\[冲突'       "$DST" 2>/dev/null || echo 0)"
 echo " 重复注释条数:  $(grep -c '\[重复规则\]' "$DST" 2>/dev/null || echo 0)"
-echo " GooglePlay修复: $(grep -c '\[GooglePlay-Fix\]' "$DST" 2>/dev/null || echo 0)"
+ echo " GooglePlay修复: $(grep -c '\[GooglePlay-Fix\]' "$DST" 2>/dev/null || echo 0)"
+ echo " Google放行注入: $(grep -c '\[Google-放行\]' "$DST" 2>/dev/null || echo 0)"
 echo ""
 echo " 提示: 打开 $DST 用 grep 搜索关键词即可查看被改动的行。"
