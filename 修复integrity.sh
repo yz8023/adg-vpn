@@ -1,8 +1,14 @@
 #!/system/bin/sh
 # ============================================================
-#  修复 Play Integrity 限流(-8 TOO_MANY_REQUESTS)
-#  思路: Integrity 域名改走 国内DoH解析 + mihomo直连国内边缘节点
-#  自动检测国内DoH解析是否干净, 干净才套用, 全程带备份回滚
+#  修复 Play Integrity 限流(-8 TOO_MANY_REQUESTS)  v2
+#  思路: 公共DoH拿不到Google国内边缘记录(实测1.12.12.12/223.5.5.5
+#        均返回全球IP 172.217.x, 直连不通), 改用 AGH $dnsrewrite 把
+#        playintegrity/safetynet 钉到 Google 中国移动边缘 IP
+#        (120.253.253.x, 实测TLS+404正常, 国内境内路径不过GFW),
+#        mihomo 对这2个域名走国内直连, 让 Integrity 请求从本机
+#        真实IP发出, 绕开机场共享出口的限流。
+#  特性: 全程备份, AGH解析验证/mihomo配置检测/端到端连通性三重
+#        失败自动回滚。
 #  运行: su -c "sh 修复integrity.sh"
 # ============================================================
 AGH_DIR="/data/adb/agh"
@@ -36,65 +42,48 @@ wait_agh() {
         sleep 3
     fi
 }
+rollback_all() {
+    cp -f "$bak" "$YAML" 2>/dev/null
+    cp -f "$bakc" "$CFG" 2>/dev/null
+    kill_agh; wait_agh
+    "$BOX_DIR/scripts/box.service" restart 2>/dev/null
+}
 
+[ -f "$YAML" ] || { echo "未找到 $YAML"; exit 1; }
+[ -f "$CFG" ] || { echo "未找到 $CFG"; exit 1; }
 port=$(sed -n '/^dns:/,/^[^[:space:]]/s/^[[:space:]]*port:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$YAML" | head -n 1)
 [ -n "$port" ] || port=53
-DS="checking.play.googleapis.com playintegrity.googleapis.com safetynet.googleapis.com"
 
-hr; echo "[1] 国内 DoH(1.12.12.12) 对 Integrity 域名的解析检测"
-allclean=1
-for d in $DS; do
-    json=$(curl -s -m 8 -H "accept: application/dns-json" \
-        "https://1.12.12.12/dns-query?name=$d&type=A" 2>/dev/null)
-    ips=$(echo "$json" | grep -o '"data":"[^"]*"' | sed 's/"data":"//;s/"//' | tr '\n' ' ')
-    clean=0
-    case "$ips" in
-        *203.208.*|*120.253.*|*180.163.*) clean=1 ;;
-    esac
-    [ "$clean" = "1" ] && tag="干净(国内边缘)" || tag="不干净/被污染"
-    [ "$clean" = "1" ] || allclean=0
-    echo "  $d"
-    echo "    解析: ${ips:-无应答} -> $tag"
-done
-
-hr; echo "[2] 检测结论与处理"
-if [ "$allclean" != "1" ]; then
-    echo "  国内 DoH 解析不干净, 直连方案不可用。"
-    echo "  限流是机场共享出口 IP 触发的, 只能:"
-    echo "    a) mihomo 面板(127.0.0.1:9090/ui)换一个节点, 等 10 分钟重试"
-    echo "    b) 或等限流自然过期(通常 10-30 分钟)"
-    echo "  未对系统做任何修改。"
-    exit 0
-fi
-echo "  国内 DoH 解析干净, 自动套用直连方案..."
-
-hr; echo "[3] AGH: Integrity 域名解析改回国内 DoH"
 bak="$YAML.bak.integrity.$(date +%m%d%H%M)"
+bakc="$CFG.bak.integrity.$(date +%m%d%H%M)"
+
+hr; echo "[1] AGH: 把 playintegrity/safetynet 钉到国内边缘IP"
 cp -f "$YAML" "$bak"
-NEWUP="[\/checking.play.googleapis.com\/playintegrity.googleapis.com\/safetynet.googleapis.com\/]https://1.12.12.12/dns-query"
-if grep -q "checking.play.googleapis.com" "$YAML"; then
+if grep -q "dnsrewrite=120.253.253" "$YAML"; then
     echo "  已存在, 跳过"
 else
-    "$BB" awk -v ins="    - '$NEWUP'" '
-        !done && /^  upstream_dns:/ { print; print ins; done=1; next } { print }' \
-        "$YAML" > "$YAML.tmp" && mv "$YAML.tmp" "$YAML" && echo "  已插入(位于 googleapis 宽规则之前)"
+    "$BB" awk '
+        !done && /^user_rules:/ {
+            print
+            print "  - '"'"'||playintegrity.googleapis.com^$dnsrewrite=120.253.253.226'"'"'"
+            print "  - '"'"'||playintegrity.googleapis.com^$dnsrewrite=120.253.253.34'"'"'"
+            print "  - '"'"'||safetynet.googleapis.com^$dnsrewrite=120.253.253.226'"'"'"
+            print "  - '"'"'||safetynet.googleapis.com^$dnsrewrite=120.253.253.34'"'"'"
+            done=1; next
+        } { print }' "$YAML" > "$YAML.tmp" && mv "$YAML.tmp" "$YAML" \
+        && echo "  已注入 4 条 dnsrewrite(每域名2个边缘IP互备)"
 fi
-# kill AGH 后由守护循环自动拉起
-kill_agh
-wait_agh
-chk=$("$BB" nslookup checking.play.googleapis.com "127.0.0.1:$port" 2>/dev/null | grep -o "203\.208\.[0-9.]*\|120\.253\.[0-9.]*\|180\.163\.[0-9.]*" | head -n 1)
+kill_agh; wait_agh
+chk=$("$BB" nslookup playintegrity.googleapis.com "127.0.0.1:$port" 2>/dev/null | grep -o "120\.253\.253\.[0-9.]*" | head -n 1)
 if [ -n "$chk" ]; then
-    echo "  AGH 已生效: checking.play.googleapis.com -> $chk (国内边缘)"
+    echo "  AGH 验证通过: playintegrity.googleapis.com -> $chk"
 else
-    echo "  !! AGH 解析未见国内边缘 IP, 回滚 AGH 配置"
-    cp -f "$bak" "$YAML"
-    kill_agh
-    wait_agh
+    echo "  !! AGH 解析未见 120.253.253.x, 回滚"
+    cp -f "$bak" "$YAML"; kill_agh; wait_agh
     exit 1
 fi
 
-hr; echo "[4] mihomo: Integrity 域名改为国内直连"
-bakc="$CFG.bak.integrity.$(date +%m%d%H%M)"
+hr; echo "[2] mihomo: Integrity 域名改为国内直连"
 cp -f "$CFG" "$bakc"
 if grep -q "playintegrity.googleapis.com,国内直连" "$CFG"; then
     echo "  已存在, 跳过"
@@ -104,7 +93,6 @@ else
             !done && /DST-PORT,53/ {
                 print
                 print "  - DOMAIN,playintegrity.googleapis.com,国内直连"
-                print "  - DOMAIN,checking.play.googleapis.com,国内直连"
                 print "  - DOMAIN,safetynet.googleapis.com,国内直连"
                 done=1; next
             } { print }' "$CFG" > "$CFG.tmp"
@@ -112,17 +100,16 @@ else
         "$BB" awk '
             !done && /MATCH,/ {
                 print "  - DOMAIN,playintegrity.googleapis.com,国内直连"
-                print "  - DOMAIN,checking.play.googleapis.com,国内直连"
                 print "  - DOMAIN,safetynet.googleapis.com,国内直连"
                 done=1
             } { print }' "$CFG" > "$CFG.tmp"
     fi
     mv "$CFG.tmp" "$CFG"
-    echo "  已插入 3 条直连规则(位于最前部)"
+    echo "  已插入 2 条直连规则(位于最前部)"
 fi
 if [ -x "$BOX_DIR/bin/mihomo" ]; then
     if ! timeout 15 "$BOX_DIR/bin/mihomo" -t -d "$BOX_DIR/mihomo" -f "$CFG" > /dev/null 2>&1; then
-        echo "  !! 配置检测失败, 回滚 mihomo"
+        echo "  !! 配置检测失败, 回滚"
         cp -f "$bakc" "$CFG"
         exit 1
     fi
@@ -131,20 +118,33 @@ fi
 bin_name=$(sed -n 's/^bin_name="\([^"]*\)".*/\1/p' "$BOX_DIR/settings.ini" 2>/dev/null)
 [ -n "$bin_name" ] || bin_name="mihomo"
 sleep 4
-if pidof "$bin_name" > /dev/null 2>&1; then
-    code=$(curl -x "http://127.0.0.1:7890" -s -o /dev/null -w "%{http_code}" -m 8 \
-        "https://cp.cloudflare.com/generate_204" 2>/dev/null)
-    echo "  mihomo 重启成功, 代理抽查: HTTP $code"
-else
+if ! pidof "$bin_name" > /dev/null 2>&1; then
     echo "  !! mihomo 启动失败, 回滚"
-    cp -f "$bakc" "$CFG"
-    "$BOX_DIR/scripts/box.service" restart
+    rollback_all
     exit 1
 fi
+echo "  mihomo 重启成功"
+
+hr; echo "[3] 端到端验证(AGH解析->直连国内边缘)"
+# 期望任意 HTTP 码(通常 404); 000/超时说明直连路径不通
+code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 12 \
+    "https://playintegrity.googleapis.com/" 2>/dev/null)
+case "$code" in
+    000|"") 
+        echo "  !! playintegrity 直连不通(HTTP $code), 全量回滚"
+        rollback_all
+        echo "  已回滚到修改前状态。此网络环境下直连方案不可用,"
+        echo "  只能: 换节点 或 等限流自然过期(10-30分钟)。"
+        exit 1
+        ;;
+    *)
+        echo "  直连验证通过: playintegrity.googleapis.com -> HTTP $code"
+        ;;
+esac
 
 hr
-echo "修复已应用。Integrity 限流记录在 Google 侧有保留期:"
-echo "  等 10-30 分钟再打开之前报错的应用重试。"
-echo "  若仍报 -8, 在 mihomo 面板换一个节点(旧出口 IP 可能仍被限流)。"
+echo "修复已应用: Integrity 请求现在从本机真实IP直连Google国内边缘。"
+echo "  等 10-30 分钟(限流记录过期)再打开之前报错的应用重试。"
+echo "  若仍报 -8, 运行: sh 重启.sh box  或在面板换节点后重试。"
 echo "备份: $bak / $bakc"
 hr
