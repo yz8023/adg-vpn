@@ -17,11 +17,10 @@ for d in accounts.google.com play.googleapis.com android.clients.google.com upda
     echo "  $d -> ${r:-无解析记录}"
 done
 
-hr; echo "[B] 查询日志中 Google 域名的拦截真凶 (最近 20 条, 看 Rules.Text 就是拦它的规则)"
+hr; echo "[B] 查询日志中 Google 域名的拦截真凶 (最近 20 条, 拦截=true 时看规则)"
 grep -E '"QH":"[^"]*(google|gvt1|gstatic|googleapis)' "$AGH_DIR/bin/data/querylog.json" 2>/dev/null \
     | tail -n 20 \
-    | sed 's/.*"QH":"\([^"]*\)".*"Rules":\[[^]]*"Text":"\([^"]*\)".*"IsFiltered":\([a-z]*\).*/  \1  拦截=\3  规则=\2/' \
-    | tail -n 20
+    | "$BB" awk 'match($0,/"QH":"[^"]*"/){q=substr($0,RSTART+7,RLENGTH-8)} {f="字段缺失"; if(match($0,/"IsFiltered":(true|false)/)) f=substr($0,RSTART+13,RLENGTH-13); r="-"; if(match($0,/"Text":"[^"]*"/)) r=substr($0,RSTART+8,RLENGTH-9); print "  " q "  拦截=" f "  规则=" r}'
 n=$(grep -cE '"QH":"[^"]*(google|gvt1|gstatic|googleapis)' "$AGH_DIR/bin/data/querylog.json" 2>/dev/null)
 echo "  (日志中 Google 相关查询共 ${n:-0} 条)"
 
