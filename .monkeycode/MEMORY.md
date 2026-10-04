@@ -24,6 +24,7 @@ This file records user instructions, preferences, and teachings for reference in
   - 手机端吞吐瓶颈常是 mihomo tun 的 gvisor 用户态栈，换 stack: system 实测恢复；机场普遍封锁 speed.cloudflare.com 测速端点(TLS 握手被断)，测速用 fast.com/cachefly/tele2
   - AGH 白名单 @@||域名^$important 可压过任何过滤列表拦截；用户可能直接在 Web UI 加规则，脚本检查 yaml 注释标记会误报"旧配置"，以 querylog 的 Rules.Text 为准
   - AGH 端口随机化在 service.sh 开机时执行，改 yaml 后手动重启进程不变端口；三方一致性检查点：yaml dns.port = config.prop redir_port = mihomo nameserver 端口
+  - Play Integrity -8 限流排障：机场共享出口 IP 触发 Google 限流；公共 DoH(1.12.12.12/223.5.5.5 含 ECS) 对 googleapis 全部返回全球池 172.217.x(直连不通)，拿不到国内边缘记录；可行方案=AGH user_rules 加 $dnsrewrite=120.253.253.226/.34(Google 中国移动边缘，实测服务 playintegrity/safetynet 域名，TLS+404 正常，境内路径不过 GFW) + mihomo 前置 DOMAIN 直连规则；checking.play.googleapis.com 边缘不服务(只握手)，保持走代理；203.208.x 经典边缘已不可用；脚本=修复integrity.sh(带三重验证回滚)
 
 [模块打包发版流程]
 - Date: 2026-10-04
