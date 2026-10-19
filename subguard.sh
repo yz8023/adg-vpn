@@ -8,9 +8,10 @@
 #  安装：su -c "sh subguard.sh install"
 #  卸载：su -c "sh subguard.sh uninstall"
 #  常用：su -c "sh subguard.sh {learn|apply|update|status|doctor}"
+#  救急：su -c "sh subguard.sh restart-core"   # 出现两份 mihomo/端口占用时
 # ============================================================
 
-SUBG_VERSION="1.2.0"
+SUBG_VERSION="1.2.1"
 
 
 
@@ -276,19 +277,65 @@ detect_engine() {
     printf '%s|%s|%s|%s\n' "$ENGINE" "$CONF" "$SVC" "$BIN"
 }
 
+# 单实例锁（防止 boot / watch 同时跑出两份）
+acquire_lock() {
+    _ld="${SUBG_DATA}/run"
+    mkdir -p "$_ld" 2>/dev/null
+    _lp="${_ld}/subguard.lock"
+    if [ -f "$_lp" ]; then
+        _old=$(cat "$_lp" 2>/dev/null | tr -d ' ')
+        case "$_old" in ''|*[!0-9]*) _old=0 ;; esac
+        if [ "$_old" -gt 0 ] && [ "$_old" != "$$" ] && kill -0 "$_old" 2>/dev/null; then
+            return 1
+        fi
+    fi
+    echo $$ > "$_lp"
+    return 0
+}
+
+# 当前内核 pid 列表（mihomo / sing-box）
+core_pids() {
+    _p=""
+    # 直接读 /proc/<pid>/cmdline，不依赖 ps 的列顺序（Android 与 Linux 表现不同）
+    for _d in /proc/[0-9]*; do
+        [ -r "${_d}/cmdline" ] || continue
+        _c=""
+        IFS= read -r _c < "${_d}/cmdline" 2>/dev/null
+        case "$_c" in
+            *mihomo*|*sing-box*) _p="$_p ${_d#/proc/}" ;;
+        esac
+    done
+    echo $_p
+}
+core_count() { _c=0; for _i in $(core_pids); do _c=$((_c+1)); done; echo "$_c"; }
+
+# 等 box 自己把内核拉起来（开机时用，避免我们抢先启动第二个实例）
+wait_core_ready() {
+    _t="${1:-150}"; _i=0
+    while [ "$_i" -lt "$_t" ]; do
+        core_running && { logi "内核已就绪（等待 ${_i}s，pid $(core_pids)）"; return 0; }
+        sleep 3; _i=$((_i+3))
+    done
+    logw "等待内核就绪超时（${_t}s），当前内核进程数 $(core_count)"
+    return 1
+}
+
 core_running() {
+    [ -n "$(core_pids)" ] && return 0
     if [ -f /data/adb/box/run/box.pid ]; then
         p=$(cat /data/adb/box/run/box.pid 2>/dev/null | tr -d ' \n')
         [ -n "$p" ] && kill -0 "$p" 2>/dev/null && return 0
     fi
-    pidof mihomo >/dev/null 2>&1 && return 0
-    pidof sing-box >/dev/null 2>&1 && return 0
-    ps -A 2>/dev/null | grep -E '[m]ihomo|[s]ing-box' >/dev/null 2>&1 && return 0
     return 1
 }
 
 control_core() {
     ACT="$1"
+    # 已经在跑就绝不重复 start —— 这是开机端口冲突的根因
+    if [ "$ACT" = "start" ] && core_running; then
+        logd "内核已在运行（pid $(core_pids)），跳过 start"
+        return 0
+    fi
     if [ -n "$SVC" ] && [ -x "$SVC" ]; then
         "$SVC" "$ACT" >/dev/null 2>&1 && { logi "box.service $ACT 已执行"; return 0; }
     fi
@@ -467,6 +514,8 @@ AGH_REWRITE=0
 
 # 【10】守护参数
 CHECK_INTERVAL=120
+# 开机后多少秒内不介入内核启停（防与 box_service.sh 抢启动；太小会端口冲突）
+BOOT_GRACE=180
 UPDATE_INTERVAL=21600
 PIN_INTERVAL=43200
 FAIL_OPEN=1
@@ -478,6 +527,7 @@ load_conf() {
     . "$SUBG_CONF" 2>/dev/null
     [ -z "$PROTECT_DOMAINS" ] && PROTECT_DOMAINS=""
     [ -z "$CHECK_INTERVAL" ] && CHECK_INTERVAL=120
+    [ -z "$BOOT_GRACE" ] && BOOT_GRACE=180
     [ -z "$UPDATE_INTERVAL" ] && UPDATE_INTERVAL=21600
     [ -z "$PIN_INTERVAL" ] && PIN_INTERVAL=43200
     [ -z "$PIN_MAX" ] && PIN_MAX=8
@@ -597,6 +647,7 @@ cmd_apply() {
     logi "本次需要直连的域名（共 $(wc -l < "$DOMFILE" | tr -d ' ') 个）: ${DLIST}"
 
     changed=0
+    AGH_CHANGED=0
 
     # ---- 1) mihomo rules ----
     rblk="${SUBG_STATE}/.rules.blk"
@@ -689,6 +740,7 @@ cmd_apply() {
                 if apply_block "$ay" '^user_rules:' "$ablk" "agh"; then
                     logi "已更新 AdGuardHome user_rules（$(grep -c '@@' "$ablk" | tr -d ' ') 条放行）"
                     changed=2
+                    AGH_CHANGED=1
                 fi
             fi
         fi
@@ -696,7 +748,8 @@ cmd_apply() {
 
     # ---- 4) 生效 ----
     [ "$changed" -ge 1 ] && reload_core "例外规则更新"
-    [ "$changed" = "2" ] && agh_restart
+    # 开机模式下先不动 AGH 进程，等内核就绪后统一处理
+    [ "$AGH_CHANGED" = "1" ] && [ "${SUBG_BOOT_MODE:-0}" != "1" ] && agh_restart
 
     # ---- 5) 关掉会删档的官方更新 ----
     [ "${TAKE_OVER_UPDATE:-1}" = "1" ] && [ -f /data/adb/box/settings.ini ] && take_over_box_update
@@ -719,22 +772,40 @@ take_over_box_update() {
     return 0
 }
 
-reload_core() {
-    reason="$1"
+# 只走 API 热重载，绝不启停进程
+hot_reload() {
+    [ -n "$CURL" ] || return 1
+    core_running || return 1
     port=$(sed -n 's/^external-controller:[[:space:]]*//p' "$CONF" 2>/dev/null | head -1 | tr -d '"')
     secret=$(sed -n 's/^secret:[[:space:]]*//p' "$CONF" 2>/dev/null | head -1 | tr -d '"'"'")
     p="${port##*:}"; [ -z "$p" ] && p=9090
     p="${p##* }"
-    if [ -n "$CURL" ] && core_running; then
-        if [ -n "$secret" ]; then
-            "$CURL" -s --max-time 8 -X PUT -H "Authorization: Bearer ${secret}" -H 'Content-Type: application/json' \
-                -d "{\"path\":\"${CONF}\"}" "http://127.0.0.1:${p}/configs?force=true" >/dev/null 2>&1 \
-                && { logi "内核已热重载配置（${reason}；若失败内核会保留旧配置，不会断网）"; return 0; }
+    if [ -n "$secret" ]; then
+        "$CURL" -s --max-time 8 -X PUT -H "Authorization: Bearer ${secret}" -H 'Content-Type: application/json' \
+            -d "{\"path\":\"${CONF}\"}" "http://127.0.0.1:${p}/configs?force=true" >/dev/null 2>&1 && return 0
+    else
+        "$CURL" -s --max-time 8 -X PUT -H 'Content-Type: application/json' \
+            -d "{\"path\":\"${CONF}\"}" "http://127.0.0.1:${p}/configs?force=true" >/dev/null 2>&1 && return 0
+    fi
+    return 1
+}
+
+reload_core() {
+    reason="$1"
+
+    # 开机模式：只写配置，绝不重启内核（重启会与 box_service.sh 抢端口）
+    if [ "${SUBG_BOOT_MODE:-0}" = "1" ]; then
+        if hot_reload; then
+            logi "内核已热重载（${reason}）"
         else
-            "$CURL" -s --max-time 8 -X PUT -H 'Content-Type: application/json' \
-                -d "{\"path\":\"${CONF}\"}" "http://127.0.0.1:${p}/configs?force=true" >/dev/null 2>&1 \
-                && { logi "内核已热重载配置（${reason}）"; return 0; }
+            logi "配置已写入；内核此刻未就绪，本次不动进程（开机模式，下次启动自动生效）"
         fi
+        return 0
+    fi
+
+    if hot_reload; then
+        logi "内核已热重载配置（${reason}）"
+        return 0
     fi
     if [ -f /data/adb/agh/scripts/restart.sh ]; then
         sh /data/adb/agh/scripts/restart.sh box >/dev/null 2>&1 && { logi "已通过 restart.sh 重启 box（含配置检测）"; return 0; }
@@ -934,6 +1005,7 @@ cmd_watch() {
     bad=0
     now=$(date +%s 2>/dev/null || echo 0)
     last_upd="$now"; last_pin="$now"; last_dom="$now"
+    grace_until=$((now + ${BOOT_GRACE:-180}))
 
     while :; do
         sleep "$CHECK_INTERVAL"
@@ -947,6 +1019,11 @@ cmd_watch() {
         fi
 
         if ! core_running; then
+            now0=$(date +%s 2>/dev/null || echo 0)
+            if [ "$now0" -lt "$grace_until" ]; then
+                logd "开机宽限期内（还剩 $((grace_until - now0))s），不介入内核启动"
+                continue
+            fi
             bad=$((bad+1)); logw "内核未运行（第 ${bad} 次）"
             if [ "$bad" -le 2 ]; then control_core start || control_core restart
             elif [ "${FAIL_OPEN:-1}" = "1" ]; then fail_open; bad=0; fi
@@ -994,7 +1071,8 @@ cmd_doctor() {
     echo "    机型/系统     : $(getprop ro.product.model 2>/dev/null) / Android $(getprop ro.build.version.release 2>/dev/null)"
     echo "    代理模块      : ${ENGINE:-未知}"
     echo "    内核配置      : ${CONF:-未找到}"
-    echo "    内核进程      : $(core_running && echo 运行中 || echo 未运行)"
+    _cc=$(core_count)
+    echo "    内核进程      : $([ "$_cc" -gt 0 ] && echo "运行中（${_cc} 个）" || echo 未运行)$([ "$_cc" -gt 1 ] && echo "  ⚠️ 有重复进程，会抢端口！执行 restart-core")"
     echo "    AdGuardHome   : $(agh_yaml 2>/dev/null || echo 未找到) / $(agh_running && echo 运行中 || echo 未运行)"
     echo "    curl          : ${CURL:-未找到}"
     echo
@@ -1093,6 +1171,34 @@ cmd_test_url() {
     return 1
 }
 
+# 清掉重复内核进程并干净地重起一次（用于修复已经发生的端口冲突）
+cmd_restart_core() {
+    detect
+    n=$(core_count)
+    logi "当前内核进程数: ${n}"
+    if [ "$n" -gt 0 ]; then
+        for _pid in $(core_pids); do
+            logi "  结束 mihomo/sing-box 进程 ${_pid}"
+            kill -TERM "$_pid" 2>/dev/null
+        done
+        sleep 3
+        for _pid in $(core_pids); do
+            logw "  强制结束 ${_pid}"
+            kill -KILL "$_pid" 2>/dev/null
+        done
+    fi
+    rm -f /data/adb/box/run/box.pid 2>/dev/null
+    SUBG_BOOT_MODE=0; export SUBG_BOOT_MODE
+    logi "重新启动内核…"
+    control_core start
+    sleep 4
+    if core_running; then
+        logi "✔ 内核已恢复，进程 $(core_pids)"
+    else
+        loge "✘ 内核未起来，看日志: tail -n 40 /data/adb/box/run/mihomo.log"
+    fi
+}
+
 cmd_rollback() {
     detect
     [ -n "$CONF" ] && [ -f "$CONF" ] || { loge "找不到配置文件"; return 1; }
@@ -1105,7 +1211,10 @@ cmd_rollback() {
 
 cmd_boot() {
     load_conf; detect
-    logi "===== subguard boot v${SUBG_VERSION} ====="
+    acquire_lock || { loge "已有 subguard 在运行，本次启动退出"; return 0; }
+    SUBG_BOOT_MODE=1
+    export SUBG_BOOT_MODE
+    logi "===== subguard boot v${SUBG_VERSION}（开机模式：只写配置，不启停内核）====="
     wait_net 90
     cmd_apply
     if [ -n "$CONF" ] && [ -f "$CONF" ]; then
@@ -1115,6 +1224,15 @@ cmd_boot() {
             else cp -f "$t" "${SUBG_LASTGOOD}/${n}" 2>/dev/null; fi
         done
     fi
+    # 等 box_service.sh 把内核拉起来，再解除开机模式（这一步是防端口冲突的关键）
+    wait_core_ready 150
+    SUBG_BOOT_MODE=0
+    export SUBG_BOOT_MODE
+    # 内核就绪后补一次热重载（若它在我们写配置之前就读过了）
+    if core_running; then
+        hot_reload && logi "内核已加载新配置（开机补热重载）"
+    fi
+    [ "${AGH_CHANGED:-0}" = "1" ] && agh_restart
     ( sleep 20; cmd_update ) >/dev/null 2>&1 &
     cmd_watch
 }
@@ -1212,5 +1330,6 @@ case "$1" in
     watch)     need_root "$@"; load_conf; cmd_watch ;;
     test-url)  need_root "$@"; load_conf; cmd_test_url "$2" ;;
     rollback)  need_root "$@"; load_conf; cmd_rollback ;;
+    restart-core) need_root "$@"; load_conf; cmd_restart_core ;;
     *)         usage ;;
 esac
